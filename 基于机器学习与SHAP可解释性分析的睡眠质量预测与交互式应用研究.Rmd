@@ -1,0 +1,968 @@
+---
+title: "基于机器学习与SHAP可解释性分析的睡眠质量预测与交互式应用研究"
+output: html_document
+date: "2025-03-10"
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(shiny)
+library(plotly)
+library(corrplot)
+library(DT)
+library(keras)
+library(tensorflow)
+tf <- tensorflow::tf
+library(caret)
+library(nnet)
+library(randomForest)
+library(vip)
+library(cowplot)
+library(ggpubr)
+library(ggsci)
+library(agricolae)
+```
+
+```{r}
+# 数据加载与基础清洗
+data <- read_csv("https://uwmadison.box.com/shared/static/bjijfwc7v2su9idt1ft1d9rmozgm2h1k.csv") %>%
+  mutate(
+    Gender = factor(Gender),
+    Occupation = factor(Occupation),
+    `BMI Category` = factor(`BMI Category`),
+    `Sleep Disorder` = factor(`Sleep Disorder`)
+  ) %>%
+  filter(`Heart Rate` >= 40 & `Heart Rate` <= 200)  # 生理合理范围过滤
+
+head(data)
+
+# 变量分布可视化
+p_dist <- cowplot::plot_grid(
+  ggplot(data, aes(x = `Heart Rate`)) + geom_density(fill = "#69b3a2"),
+  ggplot(data, aes(x = `Daily Steps`)) + geom_histogram(bins = 30, fill = "#1E90FF"),
+  ncol = 2
+)
+print(p_dist)
+```
+
+
+```{r}
+summarize_missing <- function(data) {
+    sapply(data, function(x) sum(is.na(x)))
+}
+summarize_missing(data)
+```
+
+```{r}
+data$Gender <- as.factor(data$Gender)
+data$Occupation <- as.factor(data$Occupation)
+data$`BMI Category` <- as.factor(data$`BMI Category`)
+data$`Sleep Disorder` <- as.factor(data$`Sleep Disorder`)
+```
+
+```{r}
+cor_matrix <- cor(data[, sapply(data, is.numeric)], use = "complete.obs")
+print(cor_matrix)
+```
+
+```{r}
+col <- colorRampPalette(c("#B22222", "white", "#1E90FF"))(200)
+
+corrplot(
+  cor_matrix,
+  method = "ellipse",
+  type = "upper",
+  col = col,
+  tl.col = "black",
+  tl.cex = 0.9,
+  addCoef.col = "black",
+  number.cex = 0.7,
+  mar = c(0, 0, 1, 0),
+  title = "Correlation Matrix"
+)
+```
+
+```{r}
+anova_result1_Gender <- aov(`Sleep Duration` ~ Gender, data = data)
+summary(anova_result1_Gender)
+
+anova_result1_Occupation <- aov(`Sleep Duration` ~ Occupation, data = data)
+summary(anova_result1_Occupation)
+
+anova_result1_BMI_Category <- aov(`Sleep Duration` ~ `BMI Category`, data = data)
+summary(anova_result1_BMI_Category)
+
+anova_result1_Sleep_Disorder <- aov(`Sleep Duration` ~ `Sleep Disorder`, data = data)
+summary(anova_result1_Sleep_Disorder)
+```
+
+```{r}
+anova_result2_Gender <- aov(`Quality of Sleep` ~ Gender, data = data)
+summary(anova_result2_Gender)
+
+anova_result2_Occupation <- aov(`Quality of Sleep` ~ Occupation, data = data)
+summary(anova_result2_Occupation)
+
+anova_result2_BMI_Category <- aov(`Quality of Sleep` ~ `BMI Category`, data = data)
+summary(anova_result2_BMI_Category)
+
+anova_result2_Sleep_Disorder <- aov(`Quality of Sleep` ~ `Sleep Disorder`, data = data)
+summary(anova_result2_Sleep_Disorder)
+```
+
+```{r}
+# ANOVA事后检验
+aov_res <- aov(`Sleep Duration` ~ `BMI Category`, data = data)
+tukey <- HSD.test(aov_res, "BMI Category", group = TRUE)
+plot(tukey)
+
+# 非参数检验
+kruskal.test(`Quality of Sleep` ~ Occupation, data = data)
+```
+
+
+```{r}
+data_model <- data %>% 
+  select(`Quality of Sleep`, Age, `Stress Level`, `Physical Activity Level`, `Heart Rate`, `Daily Steps`)
+
+set.seed(123)
+index <- sample(1:nrow(data_model), 0.8 * nrow(data_model))
+train <- data_model[index, ]
+test <- data_model[-index, ]
+
+x_train <- as.matrix(train[, -1])
+y_train <- to_categorical(train$`Quality of Sleep` - 1)
+
+x_test <- as.matrix(test[, -1])
+y_test <- to_categorical(test$`Quality of Sleep` - 1)
+
+input_center <- attr(scale(x_train), "scaled:center")
+input_scale <- attr(scale(x_train), "scaled:scale")
+
+x_train <- scale(x_train, center = input_center, scale = input_scale)
+x_test <- scale(x_test, center = input_center, scale = input_scale)
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(ncol(x_train))) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 9, activation = "softmax")
+
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = "accuracy"
+)
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 50,
+  batch_size = 16,
+  validation_split = 0.2,
+  callbacks = list(callback_early_stopping(patience = 5)),
+  verbose = 0
+)
+
+model %>% evaluate(x_test, y_test)
+```
+
+```{r}
+scaling_parameters_to_save <- list(
+  center = input_center,
+  scale = input_scale
+)
+
+saveRDS(scaling_parameters_to_save, "scaling_params.rds")
+
+message("Successfully saved scaling parameters to scaling_params.rds")
+```
+
+
+```{r}
+save_model_hdf5(model, "sleep_model.h5")
+model <- load_model_hdf5("sleep_model.h5")
+```
+
+```{r}
+plot_df <- data.frame(
+  epoch = 1:length(history$metrics$loss),
+  loss = history$metrics$loss,
+  val_loss = history$metrics$val_loss,
+  acc = history$metrics$accuracy,
+  val_acc = history$metrics$val_accuracy
+)
+
+plot_df_long <- tidyr::pivot_longer(plot_df, cols = -epoch)
+
+ggplot(plot_df_long, aes(x = epoch, y = value, color = name)) +
+  geom_line(size = 1) +
+  theme_minimal() +
+  labs(title = "Training History", x = "Epoch", y = "Value", color = "Metric")
+```
+
+```{r}
+predict_softmax_probs <- function(age, stress, activity, heart_rate, steps) {
+  clamp <- function(x, min, max) pmin(pmax(x, min), max)
+  input <- data.frame(
+    Age = clamp(age, 18, 100),
+    `Stress Level` = clamp(stress, 1, 10),
+    `Physical Activity Level` = clamp(activity, 0, 10),
+    `Heart Rate` = clamp(heart_rate, 40, 200),
+    `Daily Steps` = clamp(steps, 0, 30000)
+  )
+  input_scaled <- scale(input, center = input_center, scale = input_scale)
+  pred <- model %>% predict(input_scaled)
+  return(as.numeric(pred[1, ]))
+}
+
+class_label <- function(class_id) {
+  if (class_id <= 3) return("Poor")
+  else if (class_id <= 6) return("Average")
+  else return("Good")
+}
+```
+
+```{r}
+data$`BMI Category` <- as.factor(recode(data$`BMI Category`,
+                             "Normal" = "Normal weight",
+                             "Normal Weight" = "Normal weight",
+                             "Overweight" = "Overweight",
+                             "Obese" = "Overweight"))
+
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML(
+      "
+      body { background-color: #f8f9fa; }
+      .shiny-input-container { margin-bottom: 20px; }
+      h3, h4 { color: #2c3e50; font-weight: 600; }
+      .tab-content { background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+      .well { background-color: #ffffff; border: 1px solid #e0e0e0; box-shadow: none; }
+      .navbar { margin-bottom: 0px; }
+      .form-control {
+  border-radius: 6px;
+  border: 1px solid #ced4da;
+  box-shadow: none;
+}
+
+.btn {
+  background-color: #007bff;
+  color: white;
+  font-weight: bold;
+  border-radius: 6px;
+  padding: 6px 12px;
+  border: none;
+}
+
+.btn:hover {
+  background-color: #0056b3;
+  color: white;
+}
+      "
+    ))
+  ),
+  titlePanel("Detailed Sleep Data Analysis"),
+  fluidRow(
+    column(4, selectInput("gender", "Select Gender:", choices = c("All", levels(data$Gender)), selected = "All")),
+    column(4, selectInput("bmi", "Select BMI Category:", choices = c("All", levels(data$`BMI Category`)), selected = "All")),
+    column(4, selectInput("occupation", "Select Occupation:", choices = c("All", levels(data$Occupation)), selected = "All"))
+  ),
+  tabsetPanel(
+    tabPanel("Data Overview",
+  tags$div(style = "padding: 20px;",
+    tags$h3("About the Dataset", style = "color:#2c3e50; font-weight:bold;"),
+    tags$p("This dataset contains health and lifestyle information related to sleep. It includes factors such as age, stress level, physical activity, heart rate, and step count. The goal is to understand how these factors influence sleep quality and duration.", style = "font-size:16px; line-height:1.6;"),
+    tags$h3("Purpose of This Shiny App", style = "margin-top:30px; color:#2c3e50; font-weight:bold;"),
+    tags$p("This Shiny application is designed for visual exploration and predictive modeling of sleep-related variables. Users can interactively examine patterns in the data, simulate lifestyle changes, and receive personalized recommendations for improving sleep quality.", style = "font-size:16px; line-height:1.6;"),
+    tags$hr(style="margin-top:30px;margin-bottom:20px;")
+  ),
+  dataTableOutput("dataOverview")
+),
+    tabPanel("Analysis with Sleep Duration",
+      dataTableOutput("filteredData_SD"),
+      fluidRow(
+        column(6, plotlyOutput("plotSleepDurationByAge")),
+        column(6, plotlyOutput("plotSleepDurationByGender"))
+      ),
+      fluidRow(
+        column(6, plotlyOutput("plotSleepDurationByBMI")),
+        column(6, plotlyOutput("plotSleepDurationByOccupation"))
+      )
+    ),
+    tabPanel("Analysis with Quality of Sleep",
+      dataTableOutput("filteredData_QS"),
+      fluidRow(
+        column(6, plotlyOutput("plotQualitySleepByAge")),
+        column(6, plotlyOutput("plotQualitySleepByStress"))
+      ),
+      fluidRow(
+        column(6, plotlyOutput("plotQualitySleepByBMI")),
+        column(6, plotlyOutput("plotQualitySleepByOccupation"))
+      )
+    ),
+    tabPanel("Predict Sleep Quality",
+      h3("Current Condition Prediction"),
+      fluidRow(
+        column(6,
+          numericInput("in_age", "Age", value = 30, min = 18, max = 100),
+          numericInput("in_stress", "Stress Level (1–10)", value = 5, min = 1, max = 10),
+          numericInput("in_activity", "Physical Activity Level (0–10)", value = 4, min = 0, max = 10),
+          numericInput("in_heart", "Heart Rate (bpm)", value = 70, min = 40, max = 200),
+          numericInput("in_steps", "Daily Steps", value = 6000, min = 0, max = 30000),
+          actionButton("goButton", "Predict Current")
+        ),
+        column(6,
+          verbatimTextOutput("prediction_result"),
+          verbatimTextOutput("prediction_label"),
+          plotlyOutput("softmax_plot")
+        )
+      ),
+      tags$hr(),
+      h3("Try Improving Your Sleep Quality"),
+      fluidRow(
+        column(6,
+          sliderInput("sim_stress", "Simulate Lower Stress Level:", min = 1, max = 10, value = 5),
+          sliderInput("sim_activity", "Simulate Higher Activity Level:", min = 0, max = 10, value = 4),
+          actionButton("simulateButton", "Simulate Improved Condition")
+        ),
+        column(6,
+          verbatimTextOutput("sim_prediction_result"),
+          verbatimTextOutput("sim_prediction_label"),
+          plotlyOutput("sim_softmax_plot"),
+          uiOutput("recommendation_text")
+        )
+      )
+    )
+  )
+)
+
+server <- function(input, output) {
+  rv <- reactiveValues(current_class = NULL)
+  
+  filteredData <- reactive({
+    df <- data
+    if (input$gender != "All") df <- df %>% filter(Gender == input$gender)
+    if (input$bmi != "All") df <- df %>% filter(`BMI Category` == input$bmi)
+    if (input$occupation != "All") df <- df %>% filter(Occupation == input$occupation)
+    df
+  })
+
+  output$dataOverview <- renderDataTable({
+    datatable(filteredData(), options = list(pageLength = 5))
+  })
+
+  output$filteredData_SD <- renderDataTable({
+    datatable(filteredData())
+  })
+  output$plotSleepDurationByAge <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = Age, y = `Sleep Duration`)) +
+               geom_point() + geom_smooth(method = "lm") +
+               labs(title = "Age vs Sleep Duration"))
+  })
+  output$plotSleepDurationByGender <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = Gender, y = `Sleep Duration`, fill = Gender)) +
+               geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+  output$plotSleepDurationByBMI <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = `BMI Category`, y = `Sleep Duration`, fill = `BMI Category`)) +
+               geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+  output$plotSleepDurationByOccupation <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = Occupation, y = `Sleep Duration`, fill = Occupation)) +
+               geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+
+  output$filteredData_QS <- renderDataTable({
+    datatable(filteredData())
+  })
+  output$plotQualitySleepByAge <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = Age, y = `Quality of Sleep`)) +
+               geom_jitter(width = 0.3, alpha = 0.6, color = "blue") +
+               theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+  output$plotQualitySleepByStress <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = `Stress Level`, y = `Quality of Sleep`)) +
+               geom_bar(stat = "summary", fun = "mean", fill = "steelblue", alpha = 0.7) +
+               theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+  output$plotQualitySleepByBMI <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = `BMI Category`, y = `Quality of Sleep`, fill = `BMI Category`)) +
+               geom_boxplot(alpha = 0.7) + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+  output$plotQualitySleepByOccupation <- renderPlotly({
+    ggplotly(ggplot(filteredData(), aes(x = Occupation, y = `Quality of Sleep`, fill = Occupation)) +
+               geom_boxplot(alpha = 0.7) + theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+  })
+
+  observeEvent(input$goButton, {
+    probs <- predict_softmax_probs(input$in_age, input$in_stress, input$in_activity,
+                                    input$in_heart, input$in_steps)
+    class_id <- which.max(probs)
+    label <- class_label(class_id)
+
+    output$prediction_result <- renderPrint({ paste("Predicted Sleep Quality Class:", class_id) })
+    output$prediction_label <- renderPrint({ paste("Predicted Category:", label) })
+
+    output$softmax_plot <- renderPlotly({
+      probs_percent <- round(probs * 100, 1)
+      labels <- paste0("Class ", 1:length(probs), " (", probs_percent, "%)")
+      plot_ly(x = probs_percent, y = labels, type = "bar", orientation = "h",
+              text = paste0(probs_percent, "%"), textposition = "outside",
+              marker = list(color = "rgba(0,123,255,0.7)", line = list(color = "rgba(0,123,255,1)", width = 1.5))) %>%
+        layout(title = list(text = "Predicted Class Probabilities", font = list(size = 18)),
+               xaxis = list(title = "Probability (%)", range = c(0, max(probs_percent) + 10)),
+               yaxis = list(title = "Sleep Quality Class"), margin = list(l = 100))
+    })
+
+    rv$current_class <- class_id
+  })
+
+  observeEvent(input$simulateButton, {
+    probs_sim <- predict_softmax_probs(input$in_age, input$sim_stress, input$sim_activity,
+                                       input$in_heart, input$in_steps)
+
+    if (is.null(rv$current_class)) {
+      probs_current <- predict_softmax_probs(input$in_age, input$in_stress, input$in_activity,
+                                             input$in_heart, input$in_steps)
+      rv$current_class <- which.max(probs_current)
+    }
+
+    class_sim <- which.max(probs_sim)
+    label_sim <- class_label(class_sim)
+
+    output$sim_prediction_result <- renderPrint({ paste("Simulated Class:", class_sim) })
+    output$sim_prediction_label <- renderPrint({ paste("Simulated Category:", label_sim) })
+
+    output$sim_softmax_plot <- renderPlotly({
+      probs_percent <- round(probs_sim * 100, 1)
+      labels <- paste0("Class ", 1:length(probs_sim), " (", probs_percent, "%)")
+      plot_ly(x = probs_percent, y = labels, type = "bar", orientation = "h",
+              text = paste0(probs_percent, "%"), textposition = "outside",
+              marker = list(color = "rgba(40,167,69,0.7)", line = list(color = "rgba(40,167,69,1)", width = 1.5))) %>%
+        layout(title = list(text = "Simulated Class Probabilities", font = list(size = 18)),
+               xaxis = list(title = "Probability (%)", range = c(0, max(probs_percent) + 10)),
+               yaxis = list(title = "Sleep Quality Class"), margin = list(l = 100))
+    })
+
+    output$recommendation_text <- renderUI({
+  if (!is.null(rv$current_class)) {
+    if (class_sim > rv$current_class) {
+      HTML("<span style='color:green; font-weight:bold;'>&#9989; Your simulated inputs lead to a better predicted sleep quality.<br>Consider reducing stress or increasing activity level to improve sleep.</span>")
+    } else if (class_sim == rv$current_class) {
+      HTML("<span style='color:blue;'>&#8505; Your simulated inputs result in the same prediction.<br>Further adjustments might be needed to improve sleep quality.</span>")
+    } else {
+      HTML("<span style='color:orange; font-weight:bold;'>&#9888; Your simulated changes resulted in a lower prediction.<br>Avoid increasing stress or reducing physical activity.</span>")
+    }
+  } else {
+    HTML("<span style='color:gray;'>&#8505; Please run the current prediction first.</span>")
+  }
+})
+  })
+}
+
+shinyApp(ui = ui, server = server)
+```
+
+
+
+```{r}
+x <- data[, c("Age", "Stress Level", "Physical Activity Level", "Heart Rate", "Daily Steps")]
+y_raw <- as.factor(data$`Quality of Sleep`)   
+
+set.seed(123)
+train_idx <- caret::createDataPartition(y_raw, p = 0.8, list = FALSE)
+
+x_train <- as.data.frame(x[train_idx, ])
+x_test <- as.data.frame(x[-train_idx, ])
+y_train <- droplevels(y_raw[train_idx])     
+y_test <- droplevels(y_raw[-train_idx])
+
+# Logistic Regression
+log_model <- caret::train(x_train, y_train, method = "multinom", trace = FALSE)
+log_pred <- predict(log_model, x_test)
+log_cm <- confusionMatrix(log_pred, y_test)
+
+# Random Forest
+rf_model <- caret::train(x_train, y_train, method = "rf")
+rf_pred <- predict(rf_model, x_test)
+rf_cm <- confusionMatrix(rf_pred, y_test)
+
+# DNN Accuracy from training history
+dnn_acc <- if (exists("history")) max(history$metrics$val_accuracy) else NA
+
+acc_df <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "DNN"),
+  Accuracy = c(log_cm$overall["Accuracy"], rf_cm$overall["Accuracy"], dnn_acc)
+)
+
+ggplot(acc_df, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_col(width = 0.6) +
+  ylim(0, 1) +
+  labs(title = "Model Accuracy Comparison", y = "Accuracy") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+
+## 深度神经网络结构与训练增强
+```{r}
+x_matrix <- as.matrix(scale(x))
+
+y_train <- y[train_idx]
+y_test <- y[-train_idx]
+num_classes <- length(levels(y_train))
+
+y_train_dl <- to_categorical(as.numeric(y_train) - 1, num_classes = num_classes)
+y_test_dl  <- to_categorical(as.numeric(y_test) - 1, num_classes = num_classes)
+
+x_train_dl <- x_matrix[train_idx, ]
+x_test_dl  <- x_matrix[-train_idx, ]
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(ncol(x_train_dl))) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = num_classes, activation = "softmax")
+
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = "accuracy"
+)
+
+history <- model %>% fit(
+  x_train_dl, y_train_dl,
+  epochs = 50,
+  batch_size = 16,
+  validation_split = 0.2,
+  callbacks = list(callback_early_stopping(patience = 5)),
+  verbose = 0
+)
+
+plot_df <- data.frame(
+  epoch = 1:length(history$metrics$loss),
+  loss = history$metrics$loss,
+  val_loss = history$metrics$val_loss,
+  acc = history$metrics$accuracy,
+  val_acc = history$metrics$val_accuracy
+)
+
+plot_df_long <- tidyr::pivot_longer(plot_df, cols = -epoch)
+
+ggplot(plot_df_long, aes(x = epoch, y = value, color = name)) +
+  geom_line(size = 1) +
+  theme_minimal() +
+  labs(title = "Training History", x = "Epoch", y = "Value", color = "Metric")
+```
+
+```{r}
+imp_df <- vip::vi(rf_model$finalModel) %>%
+  dplyr::top_n(10, Importance) %>%
+  dplyr::arrange(Importance)
+
+ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#69b3a2", width = 0.5) +
+  geom_text(aes(label = round(Importance, 2)), hjust = -0.1, size = 4) +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Top 10 Important Variables (Random Forest)",
+    x = "Variables",
+    y = "Importance"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+```{r subgroup-page1, fig.width=10, fig.height=4, warning=FALSE}
+y_max <- max(data$`Quality of Sleep`, na.rm = TRUE)
+
+p1 <- ggboxplot(data, x = "BMI Category", y = "Quality of Sleep",
+                color = "BMI Category", palette = "npg", add = "jitter", na.rm = TRUE) +
+  stat_compare_means(method = "anova", label.y = y_max + 0.5) +  
+  theme_minimal() +
+  labs(title = "Sleep Quality by BMI Category")
+
+p2 <- ggbarplot(data, x = "BMI Category", y = "Sleep Duration",
+                fill = "BMI Category", palette = "npg", add = "mean_se", na.rm = TRUE) +
+  stat_compare_means(method = "anova") +
+  theme_minimal() +
+  labs(title = "Avg Sleep Duration by BMI Category")
+
+cowplot::plot_grid(p1, p2, ncol = 2)
+```
+
+```{r subgroup-page2, fig.width=10, fig.height=4, warning=FALSE}
+y_max <- max(data$`Quality of Sleep`, na.rm = TRUE)
+
+p3 <- ggboxplot(data, x = "Gender", y = "Quality of Sleep",
+                color = "Gender", palette = "aaas", add = "jitter", na.rm = TRUE) +
+  stat_compare_means(method = "t.test", label.y = y_max + 0.5) +
+  theme_minimal() +
+  labs(title = "Sleep Quality by Gender")
+
+p4 <- ggbarplot(data, x = "Gender", y = "Sleep Duration",
+                fill = "Gender", palette = "aaas", add = "mean_se", na.rm = TRUE) +
+  stat_compare_means(method = "t.test") +
+  theme_minimal() +
+  labs(title = "Avg Sleep Duration by Gender")
+
+cowplot::plot_grid(p3, p4, ncol = 2)
+```
+
+```{r subgroup-page3, fig.width=10, fig.height=4, warning=FALSE}
+y_max <- max(data$`Quality of Sleep`, na.rm = TRUE)
+
+p5 <- ggboxplot(data, x = "Occupation", y = "Quality of Sleep",
+                color = "Occupation", palette = "d3", add = "jitter", na.rm = TRUE) +
+  stat_compare_means(method = "anova", label.y = y_max + 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sleep Quality by Occupation")
+
+p6 <- ggbarplot(data, x = "Occupation", y = "Sleep Duration",
+                fill = "Occupation", palette = "d3", add = "mean_se", na.rm = TRUE) +
+  stat_compare_means(method = "anova") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Avg Sleep Duration by Occupation")
+
+cowplot::plot_grid(p5, p6, ncol = 2)
+```
+
+```{r shap-fastshap-combined, message=FALSE, warning=FALSE}
+# 安装并加载 fastshap
+library(fastshap)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(tibble)
+
+# 定义模型的概率预测函数（以“质量评分=9”为例）
+pred_fun <- function(object, newdata) {
+  predict(object, newdata, type = "prob")[, "9"]
+}
+
+# 计算训练集每个特征的 SHAP 值（100个背景样本加速）
+set.seed(123)
+shap_vals <- fastshap::explain(
+  object       = rf_model$finalModel,
+  X            = x_train,
+  pred_wrapper = pred_fun,
+  nsim         = 100
+)
+
+# 1. 全局重要性：mean(|shap|) 排序
+shap_mat    <- as.matrix(shap_vals)        # 转为矩阵
+shap_vals_df <- as.data.frame(shap_mat)    # 转为 data.frame
+colnames(shap_vals_df) <- colnames(shap_mat)
+
+imp <- apply(abs(shap_mat), 2, mean)
+imp_df <- data.frame(feature = names(imp), importance = imp) %>%
+  arrange(desc(importance))
+
+# 可视化全局重要性
+ggplot(imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#1E90FF") +
+  coord_flip() +
+  labs(
+    title = "Figure 5.1: fastshap Global Feature Importance",
+    x = "Feature", y = "Mean |SHAP value|"
+  ) +
+  theme_minimal()
+
+# 2. SHAP 依赖图示例：Stress Level
+df_plot <- data.frame(
+  Stress = x_train[["Stress Level"]],
+  SHAP   = shap_vals_df[["Stress Level"]]
+)
+ggplot(df_plot, aes(x = Stress, y = SHAP)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.2: fastshap Dependence Plot for Stress Level",
+    x = "Stress Level", y = "SHAP value"
+  ) +
+  theme_minimal()
+
+# 3. SHAP Beeswarm：Top 5 特征
+top5 <- imp_df$feature[1:5]
+beeswarm_df <- shap_vals_df %>%
+  select(all_of(top5)) %>%
+  mutate(obs = seq_len(n())) %>%
+  pivot_longer(-obs, names_to = "feature", values_to = "shap_value")
+
+ggplot(beeswarm_df, aes(
+  x = shap_value,
+  y = fct_reorder(feature, shap_value, .fun = median),
+  color = shap_value
+)) +
+  geom_jitter(height = 0.2, alpha = 0.6) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(
+    title = "Figure 5.3: SHAP Beeswarm Plot for Top 5 Features",
+    x = "SHAP Value", y = "Feature"
+  ) +
+  theme_minimal()
+
+# 4. SHAP 依赖图示例 —— Age
+age_df <- tibble(
+  Age  = x_train[["Age"]],
+  SHAP = shap_vals_df[["Age"]]
+)
+ggplot(age_df, aes(x = Age, y = SHAP)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.4: SHAP Dependence Plot for Age",
+    x = "Standardized Age", y = "SHAP Value for Age"
+  ) +
+  theme_minimal()
+
+# 5. SHAP 依赖图示例 —— Physical Activity Level
+act_df <- tibble(
+  Activity = x_train[["Physical Activity Level"]],
+  SHAP     = shap_vals_df[["Physical Activity Level"]]
+)
+ggplot(act_df, aes(x = Activity, y = SHAP)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.5: SHAP Dependence Plot for Physical Activity Level",
+    x = "Standardized Physical Activity Level", y = "SHAP Value for Activity"
+  ) +
+  theme_minimal()
+
+# 6. SHAP 值直方图 —— Stress Level
+ggplot(tibble(SHAP = shap_vals_df[["Stress Level"]]), aes(x = SHAP)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Figure 5.6: Distribution of SHAP Values for Stress Level",
+    x = "SHAP Value (Stress Level)", y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 1. 创建输出目录（若已存在则忽略）
+out_dir <- "/Users/yaoyue/毕业论文"
+
+# 2. 相关性热力图（图3.1）
+png(file.path(out_dir, "fig3.1_correlation_matrix.png"), width = 800, height = 800)
+corrplot::corrplot(
+  cor_matrix,
+  method      = "ellipse",
+  type        = "upper",
+  addCoef.col = "black",
+  number.cex  = 0.7,
+  tl.pos      = "lt",
+  col         = colorRampPalette(c("#B22222", "white", "#1E90FF"))(200),
+  title       = "Figure 3.1: Correlation Matrix"
+)
+dev.off()
+
+# 3. BMI 子群分析：睡眠质量箱线图（图3.2）
+library(ggpubr)
+p_bmi_quality <- ggpubr::ggboxplot(
+  data, x = "BMI Category", y = "Quality of Sleep",
+  color   = "BMI Category", palette = "npg", add = "jitter",
+  title   = "Figure 3.2: Sleep Quality by BMI Category"
+) + 
+  stat_compare_means(method = "anova") +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig3.2_bmi_quality.png"),
+  plot     = p_bmi_quality, width = 8, height = 4, dpi = 300
+)
+
+# 4. BMI 子群分析：睡眠时长条形图（图3.3）
+p_bmi_duration <- ggpubr::ggbarplot(
+  data, x = "BMI Category", y = "Sleep Duration",
+  fill    = "BMI Category", palette = "npg", add = "mean_se",
+  title   = "Figure 3.3: Avg Sleep Duration by BMI Category"
+) +
+  stat_compare_means(method = "anova") +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig3.3_bmi_duration.png"),
+  plot     = p_bmi_duration, width = 8, height = 4, dpi = 300
+)
+
+# 5. DNN 训练历史曲线（图4.X）
+p_history <- ggplot(plot_df_long, aes(x = epoch, y = value, color = name)) +
+  geom_line(size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Figure 4.X: Training & Validation History",
+    x     = "Epoch",
+    y     = "Metric Value",
+    color = "Metric"
+  )
+ggsave(
+  filename = file.path(out_dir, "fig4_training_history.png"),
+  plot     = p_history, width = 8, height = 5, dpi = 300
+)
+
+# 6. 随机森林特征重要性（图4.X）
+library(vip)
+rf_imp_df <- vip::vi(rf_model$finalModel) %>%
+  tibble::rownames_to_column("feature") %>%
+  dplyr::rename(importance = Importance)
+p_rf_imp <- ggplot(rf_imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#1E90FF", width = 0.6) +
+  coord_flip() +
+  labs(
+    title = "Figure 4.X: Random Forest Variable Importance",
+    x     = "Feature",
+    y     = "Importance"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig4_rf_importance.png"),
+  plot     = p_rf_imp, width = 6, height = 4, dpi = 300
+)
+
+# 7. SHAP 全局重要性（Figure 5.1）
+# 假设 imp_df 已包含 SHAP 全局重要性
+p_shap_imp <- ggplot(imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#1E90FF") +
+  coord_flip() +
+  labs(
+    title = "Figure 5.1: SHAP Global Feature Importance",
+    x     = "Feature",
+    y     = "Mean |SHAP value|"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_global_importance.png"),
+  plot     = p_shap_imp, width = 6, height = 4, dpi = 300
+)
+
+# 8. SHAP Beeswarm 图（Figure 5.3）
+# top5 <- imp_df$feature[1:5]
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+beeswarm_df <- shap_vals %>%
+  as.data.frame() %>%
+  select(all_of(imp_df$feature[1:5])) %>%
+  mutate(obs = row_number()) %>%
+  pivot_longer(-obs, names_to = "feature", values_to = "shap_value")
+p_beeswarm <- ggplot(beeswarm_df, aes(
+    x = shap_value,
+    y = fct_reorder(feature, shap_value, .fun = median),
+    color = shap_value
+  )) +
+  geom_jitter(height = 0.2, alpha = 0.6) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(
+    title = "Figure 5.3: SHAP Beeswarm Plot for Top 5 Features",
+    x     = "SHAP Value",
+    y     = "Feature"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_beeswarm.png"),
+  plot     = p_beeswarm, width = 6, height = 4, dpi = 300
+)
+
+# 9. SHAP 依赖图：Stress Level（Figure 5.2）
+p_dep_stress <- ggplot(
+  tibble(
+    Stress = x_train[["Stress Level"]],
+    SHAP   = shap_vals[, "Stress Level"]
+  ),
+  aes(x = Stress, y = SHAP)
+) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.2: SHAP Dependence Plot for Stress Level",
+    x     = "Stress Level",
+    y     = "SHAP value"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_dependence_stress.png"),
+  plot     = p_dep_stress, width = 6, height = 4, dpi = 300
+)
+
+# 10. SHAP 依赖图：Age（Figure 5.4）
+p_dep_age <- ggplot(
+  tibble(
+    Age  = x_train[["Age"]],
+    SHAP = shap_vals[, "Age"]
+  ),
+  aes(x = Age, y = SHAP)
+) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.4: SHAP Dependence Plot for Age",
+    x     = "Standardized Age",
+    y     = "SHAP value"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_dependence_age.png"),
+  plot     = p_dep_age, width = 6, height = 4, dpi = 300
+)
+
+# 11. SHAP 依赖图：Physical Activity Level（Figure 5.5）
+p_dep_act <- ggplot(
+  tibble(
+    Activity = x_train[["Physical Activity Level"]],
+    SHAP     = shap_vals[, "Physical Activity Level"]
+  ),
+  aes(x = Activity, y = SHAP)
+) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Figure 5.5: SHAP Dependence Plot for Physical Activity Level",
+    x     = "Standardized Physical Activity Level",
+    y     = "SHAP value"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_dependence_activity.png"),
+  plot     = p_dep_act, width = 6, height = 4, dpi = 300
+)
+
+# 12. SHAP 值分布直方图：Stress Level（Figure 5.6）
+p_hist_stress <- ggplot(
+  tibble(SHAP = shap_vals[, "Stress Level"]),
+  aes(x = SHAP)
+) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Figure 5.6: Distribution of SHAP Values for Stress Level",
+    x     = "SHAP Value (Stress Level)",
+    y     = "Count"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(out_dir, "fig5_shap_hist_stress.png"),
+  plot     = p_hist_stress, width = 6, height = 4, dpi = 300
+)
+```
+```{r}
+rsconnect::setAccountInfo(name='yueyao', token='6CECEE9E01C1D11ED84A338D72B8D689', secret='3RdtB+2xFOaez7wJa2WUuHuEdjh20YFRh9otzC0t')
+```
+
+```{r}
+library(rsconnect)
+rsconnect::deployApp(appName = "sleep health")
+```
+
